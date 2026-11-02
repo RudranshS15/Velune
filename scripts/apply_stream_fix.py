@@ -49,16 +49,20 @@ newpipe = Path("innertube/src/main/kotlin/com/nikhil/yt/innertube/pages/NewPipe.
 text = newpipe.read_text(encoding="utf-8")
 old_import = "import org.schabi.newpipe.extractor.services.youtube.YoutubeJavaScriptPlayerManager"
 assert text.count(old_import) == 1, f"newpipe import matches: {text.count(old_import)}"
-text = text.replace(old_import, old_import + "\nimport org.schabi.newpipe.extractor.services.youtube.YoutubeStreamExtractor")
+new_imports = (
+    old_import
+    + "\nimport org.schabi.newpipe.extractor.ServiceList"
+    + "\nimport org.schabi.newpipe.extractor.stream.StreamInfo"
+)
+text = text.replace(old_import, new_imports)
 anchor = "fun getStreamUrl("
 assert text.count(anchor) == 1, f"newpipe anchor matches: {text.count(anchor)}"
 helper = '''fun getFreshStreamUrl(videoId: String, itag: Int): Result<String> = runCatching {
-    val extractor = YoutubeStreamExtractor(
-        NewPipe.getService(0),
+    val info = StreamInfo.getInfo(
+        ServiceList.YouTube,
         "https://www.youtube.com/watch?v=$videoId",
     )
-    extractor.fetchPage()
-    extractor.audioStreams
+    info.audioStreams
         .firstOrNull { it.itag == itag }
         ?.content
         ?: throw ParsingException("No fresh stream URL for itag $itag")

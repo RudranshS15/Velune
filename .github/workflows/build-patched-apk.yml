@@ -10,7 +10,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
@@ -61,6 +60,12 @@ jobs:
           text, count = pattern.subn(replacement, text)
           assert count == 1, f"player pattern matches: {count}"
           player.write_text(text, encoding="utf-8")
+
+          app_gradle = Path("app/build.gradle.kts")
+          text = app_gradle.read_text(encoding="utf-8")
+          old = "generateLocaleConfig = true"
+          assert text.count(old) == 1, f"locale config pattern matches: {text.count(old)}"
+          app_gradle.write_text(text.replace(old, "generateLocaleConfig = false"), encoding="utf-8")
           print("Patch applied")
           PY
 
@@ -72,7 +77,9 @@ jobs:
       - name: Commit and push fix branch
         continue-on-error: true
         run: |
-          git add innertube/src/main/kotlin/com/nikhil/yt/innertube/models/response/PlayerResponse.kt app/src/main/kotlin/com/nikhil/yt/utils/YTPlayerUtils.kt
+          git add innertube/src/main/kotlin/com/nikhil/yt/innertube/models/response/PlayerResponse.kt \
+                  app/src/main/kotlin/com/nikhil/yt/utils/YTPlayerUtils.kt \
+                  app/build.gradle.kts
           git commit -m "fix(playback): tolerate missing stream expire time (issue #149)"
           git push --force origin fix/stream-expire-time
 

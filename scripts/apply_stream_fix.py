@@ -59,7 +59,7 @@ helper = '''fun getFreshStreamUrl(videoId: String, itag: Int): Result<String> = 
     )
     extractor.fetchPage()
     extractor.audioStreams
-        .firstOrNull { it.itagItem.id == itag }
+        .firstOrNull { it.itag == itag }
         ?.content
         ?: throw ParsingException("No fresh stream URL for itag $itag")
 }

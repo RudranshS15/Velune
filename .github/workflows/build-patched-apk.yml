@@ -1,0 +1,101 @@
+name: Build patched APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare fix branch from upstream main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/nikhilvishwakarma00/Velune.git
+          git fetch upstream main
+          git checkout -B fix/stream-expire-time upstream/main
+
+      - name: Apply playback fix
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          model = Path("innertube/src/main/kotlin/com/nikhil/yt/innertube/models/response/PlayerResponse.kt")
+          text = model.read_text(encoding="utf-8")
+          old = "val expiresInSeconds: Int,"
+          assert text.count(old) == 1, f"model pattern matches: {text.count(old)}"
+          model.write_text(text.replace(old, "val expiresInSeconds: Int = 0,"), encoding="utf-8")
+
+          player = Path("app/src/main/kotlin/com/nikhil/yt/utils/YTPlayerUtils.kt")
+          text = player.read_text(encoding="utf-8")
+          pattern = re.compile(
+              r"([ \t]*)if \(streamExpiresInSeconds == null\) \{\n"
+              r"[ \t]*streamPlayerResponse = null\n"
+              r"[ \t]*continue\n"
+              r"[ \t]*\}"
+          )
+
+          def replacement(match):
+              indent = match.group(1)
+              return (
+                  f"{indent}if (streamExpiresInSeconds == null || streamExpiresInSeconds <= 0) {{\n"
+                  f"{indent}    // YouTube may omit the expiry; derive it from the signed URL or default.\n"
+                  f"{indent}    streamExpiresInSeconds = selectedUrl.toHttpUrlOrNull()\n"
+                  f'{indent}        ?.queryParameter("expire")?.toLongOrNull()\n'
+                  f"{indent}        ?.let {{ (it - System.currentTimeMillis() / 1000L).toInt() }}\n"
+                  f"{indent}        ?.takeIf {{ it > 0 }} ?: 3600\n"
+                  f"{indent}}}"
+              )
+
+          text, count = pattern.subn(replacement, text)
+          assert count == 1, f"player pattern matches: {count}"
+          player.write_text(text, encoding="utf-8")
+          print("Patch applied")
+          PY
+
+      - name: Show diff
+        run: |
+          git diff --stat
+          git diff
+
+      - name: Commit and push fix branch
+        continue-on-error: true
+        run: |
+          git add innertube/src/main/kotlin/com/nikhil/yt/innertube/models/response/PlayerResponse.kt app/src/main/kotlin/com/nikhil/yt/utils/YTPlayerUtils.kt
+          git commit -m "fix(playback): tolerate missing stream expire time (issue #149)"
+          git push --force origin fix/stream-expire-time
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.8.2"
+
+      - name: Build arm64 debug APK
+        run: gradle :app:assembleArm64Debug --stacktrace -Dorg.gradle.jvmargs=-Xmx4g
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: velune-patched-debug
+          path: app/build/outputs/apk/arm64/debug/*.apk
+          if-no-files-found: error

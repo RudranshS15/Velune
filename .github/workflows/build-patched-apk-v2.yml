@@ -69,6 +69,18 @@ jobs:
           path: ${{ runner.temp }}/gradle-build.log
           if-no-files-found: ignore
 
+      - name: Publish failure log
+        if: failure()
+        continue-on-error: true
+        run: |
+          git reset --hard origin/main
+          git clean -fd
+          git checkout -B ci-log origin/main
+          tail -n 250 "$RUNNER_TEMP/gradle-build.log" > ci-failure.log || true
+          git add ci-failure.log
+          git commit -m "ci: capture v2 build failure log" || true
+          git push --force origin ci-log
+
       - name: Upload APK
         if: success()
         uses: actions/upload-artifact@v4

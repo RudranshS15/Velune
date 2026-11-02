@@ -1,0 +1,78 @@
+name: Build patched APK v2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Save patch script
+        run: cp scripts/apply_stream_fix.py /tmp/apply_stream_fix.py
+
+      - name: Prepare fix branch from upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/nikhilvishwakarma00/Velune.git
+          git fetch upstream main
+          git checkout -B fix/stream-expire-time 3385c1301a8608ca177c7cfcba1a72d2c18259a4
+
+      - name: Apply playback fixes
+        run: python3 /tmp/apply_stream_fix.py
+
+      - name: Show diff
+        run: |
+          git diff --stat
+          git diff
+
+      - name: Commit and push fix branch
+        continue-on-error: true
+        run: |
+          git add innertube/src/main/kotlin/com/nikhil/yt/innertube/models/response/PlayerResponse.kt \
+                  app/src/main/kotlin/com/nikhil/yt/utils/YTPlayerUtils.kt \
+                  innertube/src/main/kotlin/com/nikhil/yt/innertube/pages/NewPipe.kt \
+                  app/build.gradle.kts
+          git commit -m "fix(playback): tolerate missing expiry and use fresh NewPipe stream URLs"
+          git push --force origin fix/stream-expire-time
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.8.2"
+
+      - name: Build arm64 debug APK
+        run: |
+          set -o pipefail
+          gradle :app:assembleArm64Debug --stacktrace -Dorg.gradle.jvmargs=-Xmx4g 2>&1 | tee "$RUNNER_TEMP/gradle-build.log"
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-log
+          path: ${{ runner.temp }}/gradle-build.log
+          if-no-files-found: ignore
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: velune-patched-debug-v2
+          path: app/build/outputs/apk/arm64/debug/*.apk
+          if-no-files-found: error

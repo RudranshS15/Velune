@@ -158,3 +158,106 @@ helper = '''    private suspend fun clearRestoredStreamingSettings(context: Cont
 text = text.replace(helper_anchor, helper + helper_anchor)
 backup_vm.write_text(text, encoding="utf-8")
 print("Restore settings sanitized")
+
+# 6) Error 2000 is ExoPlayer's unspecified IO/source error. The official release
+# handles it with the client-cycle fallback; our recovery list omitted it. Retry
+# on 2000 and force the direct format URL so the per-client fallback is not
+# short-circuited by the NewPipe URL for every client.
+music = Path("app/src/main/kotlin/com/nikhil/yt/playback/MusicService.kt")
+text = music.read_text(encoding="utf-8")
+
+old = "private val streamRecoveryState = ConcurrentHashMap<String, Pair<Int, Long>>()"
+assert text.count(old) == 1, f"recovery state anchor matches: {text.count(old)}"
+text = text.replace(
+    old,
+    old + "\n    private val forceDirectStreamUrlMediaIds = java.util.Collections.synchronizedSet(mutableSetOf<String>())",
+)
+
+old = "error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS ||"
+assert text.count(old) == 1, f"IO retry anchor matches: {text.count(old)}"
+text = text.replace(
+    old,
+    "error.errorCode == PlaybackException.ERROR_CODE_IO_UNSPECIFIED ||\n                    " + old,
+)
+
+old = "avoidCodecs = avoidStreamCodecs,"
+assert text.count(old) == 1, f"playback call anchor matches: {text.count(old)}"
+text = text.replace(
+    old,
+    old + "\n                    forceDirectUrl = forceDirectStreamUrlMediaIds.remove(mediaId) == true,",
+)
+
+old = (
+    "            YTPlayerUtils.markStreamClientFailed(currentMediaId, failingStreamClientKey, httpStatusCode)\n"
+    "            YTPlayerUtils.markPreferredClientFailed(currentMediaId, preferredStreamClient, httpStatusCode)\n"
+    "            YTPlayerUtils.invalidateCachedStreamUrls(currentMediaId)\n"
+    "            playbackUrlCache.remove(currentMediaId)\n"
+    "            pendingStreamRefreshValidationMediaId = currentMediaId\n"
+)
+assert text.count(old) == 1, f"stream refresh block matches: {text.count(old)}"
+text = text.replace(
+    old,
+    old
+    + "            if (error.errorCode == PlaybackException.ERROR_CODE_IO_UNSPECIFIED) {\n"
+    + "                forceDirectStreamUrlMediaIds.add(currentMediaId)\n"
+    + "            }\n",
+)
+music.write_text(text, encoding="utf-8")
+
+player_utils = Path("app/src/main/kotlin/com/nikhil/yt/utils/YTPlayerUtils.kt")
+text = player_utils.read_text(encoding="utf-8")
+
+old = "        avoidCodecs: Set<String> = emptySet(),\n    ): Result<PlaybackData> = runCatching {"
+assert text.count(old) == 1, f"playback signature matches: {text.count(old)}"
+text = text.replace(
+    old,
+    "        avoidCodecs: Set<String> = emptySet(),\n        forceDirectUrl: Boolean = false,\n    ): Result<PlaybackData> = runCatching {",
+)
+
+old = "                        avoidCodecs = avoidCodecs,\n                    )"
+assert text.count(old) == 1, f"playback inner call matches: {text.count(old)}"
+text = text.replace(
+    old,
+    "                        avoidCodecs = avoidCodecs,\n                        forceDirectUrl = forceDirectUrl,\n                    )",
+)
+
+old = "        avoidCodecs: Set<String>,\n    ): PlaybackData {"
+assert text.count(old) == 1, f"inner signature matches: {text.count(old)}"
+text = text.replace(
+    old,
+    "        avoidCodecs: Set<String>,\n        forceDirectUrl: Boolean,\n    ): PlaybackData {",
+)
+
+old = "findUrlOrNull(candidate, videoId, client)"
+assert text.count(old) == 1, f"find URL call matches: {text.count(old)}"
+text = text.replace(old, "findUrlOrNull(candidate, videoId, client, forceDirectUrl)")
+
+old = "        client: YouTubeClient? = null,\n    ): String? {"
+assert text.count(old) == 1, f"find URL signature matches: {text.count(old)}"
+text = text.replace(
+    old,
+    "        client: YouTubeClient? = null,\n        forceDirectUrl: Boolean = false,\n    ): String? {",
+)
+
+pattern = re.compile(
+    r"^[ \t]*NewPipeUtils\.getFreshStreamUrl\(videoId, format\.itag\)\.getOrNull\(\)\?\.let \{ freshUrl ->\n"
+    r"^[ \t]*Timber\.tag\(logTag\)\.i\(\"Using fresh NewPipe stream URL for itag \$\{format\.itag\}\"\)\n"
+    r"^[ \t]*return freshUrl\n"
+    r"^[ \t]*\}\n"
+    r"^[ \t]*var url = NewPipeUtils\.getStreamUrl\(format, videoId, client\)",
+    re.M,
+)
+assert len(pattern.findall(text)) == 1, f"fresh URL block matches: {len(pattern.findall(text))}"
+text = pattern.sub(
+    '''        if (!forceDirectUrl) {
+            NewPipeUtils.getFreshStreamUrl(videoId, format.itag).getOrNull()?.let { freshUrl ->
+                Timber.tag(logTag).i("Using fresh NewPipe stream URL for itag ${format.itag}")
+                return freshUrl
+            }
+        }
+        var url = NewPipeUtils.getStreamUrl(format, videoId, client)''',
+    text,
+    count=1,
+)
+player_utils.write_text(text, encoding="utf-8")
+print("Error 2000 retry and direct-URL fallback added")

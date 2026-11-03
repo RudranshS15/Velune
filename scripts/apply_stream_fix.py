@@ -80,3 +80,81 @@ assert text.count(old) == 1, f"locale config pattern matches: {text.count(old)}"
 app_gradle.write_text(text.replace(old, "generateLocaleConfig = false"), encoding="utf-8")
 
 print("Patch applied")
+
+
+# 5) A restored backup must not bring back stale streaming/account settings.
+backup_vm = Path("app/src/main/kotlin/com/nikhil/yt/viewmodels/BackupRestoreViewModel.kt")
+text = backup_vm.read_text(encoding="utf-8")
+
+blocked = '''private val RESTORE_BLOCKED_KEYS = setOf(
+    "playerStreamClient",
+    "audioQuality",
+    "networkMetered",
+    "audioOffload",
+    "proxyEnabled",
+    "proxyUrl",
+    "proxyType",
+    "streamBypassProxy",
+    "webClientPoTokenEnabled",
+    "poToken",
+    "poTokenGvs",
+    "poTokenPlayer",
+    "poTokenSourceUrl",
+    "visitorData",
+    "dataSyncId",
+    "innerTubeCookie",
+    "accountName",
+    "accountEmail",
+    "accountChannelHandle",
+    "useVisitorData",
+    "useLoginForBrowse",
+)
+'''
+
+anchor = "data class BackupRestoreProgressUi("
+assert text.count(anchor) == 1, f"backup model anchor matches: {text.count(anchor)}"
+text = text.replace(anchor, blocked + "\n" + anchor)
+
+# Legacy backups can contain the binary DataStore snapshot. Restoring it would
+# overwrite every setting, bypassing the key filter below.
+pattern = re.compile(r"[ \t]*name == SETTINGS_FILENAME \|\|\n")
+assert len(pattern.findall(text)) == 1, f"legacy settings entry matches: {len(pattern.findall(text))}"
+text = pattern.sub("", text)
+
+pattern = re.compile(r"if \(keyName != null\) \{")
+assert len(pattern.findall(text)) == 1, f"settings key filter matches: {len(pattern.findall(text))}"
+text = pattern.sub("if (keyName != null && keyName !in RESTORE_BLOCKED_KEYS) {", text)
+
+# Remove values already present from an earlier restore, then apply the sanitized XML.
+pattern = re.compile(
+    r"([ \t]*)emitProgress\(\n"
+    r"[ \t]*title = title,\n"
+    r"[ \t]*step = context\.getString\(R\.string\.restore_step_restarting\),"
+)
+match = pattern.search(text)
+assert match is not None, "restore completion anchor not found"
+text = (
+    text[:match.start()]
+    + f"{match.group(1)}clearRestoredStreamingSettings(context)\n"
+    + text[match.start():]
+)
+
+helper_anchor = "    private suspend fun restoreSettingsFromXml(context: Context, inputStream: java.io.InputStream) {"
+assert text.count(helper_anchor) == 1, f"restore helper anchor matches: {text.count(helper_anchor)}"
+helper = '''    private suspend fun clearRestoredStreamingSettings(context: Context) {
+        context.dataStore.edit { prefs ->
+            RESTORE_BLOCKED_KEYS.forEach { name ->
+                prefs.remove(booleanPreferencesKey(name))
+                prefs.remove(intPreferencesKey(name))
+                prefs.remove(longPreferencesKey(name))
+                prefs.remove(floatPreferencesKey(name))
+                prefs.remove(stringPreferencesKey(name))
+                prefs.remove(stringSetPreferencesKey(name))
+            }
+        }
+    }
+
+'''
+text = text.replace(helper_anchor, helper + helper_anchor)
+backup_vm.write_text(text, encoding="utf-8")
+print("Restore settings sanitized")

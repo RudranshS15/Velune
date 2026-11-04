@@ -95,19 +95,6 @@ blocked = '''private val RESTORE_BLOCKED_KEYS = setOf(
     "proxyUrl",
     "proxyType",
     "streamBypassProxy",
-    "webClientPoTokenEnabled",
-    "poToken",
-    "poTokenGvs",
-    "poTokenPlayer",
-    "poTokenSourceUrl",
-    "visitorData",
-    "dataSyncId",
-    "innerTubeCookie",
-    "accountName",
-    "accountEmail",
-    "accountChannelHandle",
-    "useVisitorData",
-    "useLoginForBrowse",
 )
 '''
 

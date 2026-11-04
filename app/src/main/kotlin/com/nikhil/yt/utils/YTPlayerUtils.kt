@@ -33,6 +33,7 @@ import com.nikhil.yt.innertube.models.YouTubeClient.Companion.TVHTML5
 import com.nikhil.yt.innertube.models.YouTubeClient.Companion.VISIONOS
 import com.nikhil.yt.innertube.models.YouTubeClient.Companion.WEB
 import com.nikhil.yt.innertube.models.YouTubeClient.Companion.WEB_CREATOR
+import kotlinx.coroutines.CancellationException
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import timber.log.Timber
@@ -155,6 +156,7 @@ object YTPlayerUtils {
         // if provided, this preference overrides ConnectivityManager.isActiveNetworkMetered
         networkMetered: Boolean? = null,
         avoidCodecs: Set<String> = emptySet(),
+        forceDirectUrl: Boolean = false,
     ): Result<PlaybackData> = runCatching {
         val attempts =
             when (audioQuality) {
@@ -175,12 +177,81 @@ object YTPlayerUtils {
                         preferredStreamClient = preferredStreamClient,
                         networkMetered = networkMetered,
                         avoidCodecs = avoidCodecs,
+                        forceDirectUrl = forceDirectUrl,
                     )
                 }
             if (attemptResult.isSuccess) return@runCatching attemptResult.getOrThrow()
             lastError = attemptResult.exceptionOrNull()
         }
         throw lastError ?: IllegalStateException("Failed to resolve stream")
+    }
+
+    private var lastNewPipeFailure: String? = null
+
+    private fun resolvePlaybackViaNewPipe(
+        videoId: String,
+        audioQuality: AudioQuality,
+    ): PlaybackData? {
+        val result = NewPipeUtils.getFallbackAudioStream(videoId)
+        result.onFailure {
+            lastNewPipeFailure = "${it.javaClass.simpleName}: ${it.message ?: "no detail"}"
+            Timber.tag(logTag).e(it, "NewPipe fallback failed for $videoId")
+        }
+        val fallback = result.getOrNull() ?: return null
+
+        val defaultCodec = when {
+            fallback.mimeType.contains("webm", ignoreCase = true) -> "opus"
+            else -> "mp4a.40.2"
+        }
+        val codec = fallback.codec?.takeIf { it.isNotBlank() } ?: defaultCodec
+        val mimeType = if (fallback.mimeType.contains("codecs=", ignoreCase = true)) {
+            fallback.mimeType
+        } else {
+            "${fallback.mimeType}; codecs=\"$codec\""
+        }
+
+        val format = PlayerResponse.StreamingData.Format(
+            itag = fallback.itag,
+            url = fallback.url,
+            mimeType = mimeType,
+            bitrate = fallback.bitrate,
+            width = null,
+            height = null,
+            contentLength = null,
+            quality = fallback.quality ?: "unknown",
+            fps = null,
+            qualityLabel = null,
+            averageBitrate = fallback.bitrate,
+            audioQuality = null,
+            approxDurationMs = fallback.durationSeconds?.times(1000L)?.toString(),
+            audioSampleRate = null,
+            audioChannels = null,
+            loudnessDb = null,
+            lastModified = null,
+            signatureCipher = null,
+            cipher = null,
+        )
+        val expiresInSeconds = fallback.url.toHttpUrlOrNull()
+            ?.queryParameter("expire")?.toLongOrNull()
+            ?.let { (it - System.currentTimeMillis() / 1000L).toInt() }
+            ?.takeIf { it > 0 } ?: 3600
+
+        Timber.tag(logTag).i(
+            "NewPipe fallback resolved audio for $videoId (itag=${fallback.itag}, quality=$audioQuality)"
+        )
+        streamUrlCache[buildCacheKey(videoId, format.itag)] = CachedStreamUrl(
+            url = fallback.url,
+            expiresAtMs = System.currentTimeMillis() + expiresInSeconds * 1000L,
+        )
+
+        return PlaybackData(
+            audioConfig = null,
+            videoDetails = null,
+            playbackTracking = null,
+            format = format,
+            streamUrl = fallback.url,
+            streamExpiresInSeconds = expiresInSeconds,
+        )
     }
 
     private suspend fun playerResponseForPlaybackOnce(
@@ -191,6 +262,44 @@ object YTPlayerUtils {
         preferredStreamClient: PlayerStreamClient,
         networkMetered: Boolean?,
         avoidCodecs: Set<String>,
+        forceDirectUrl: Boolean,
+    ): PlaybackData {
+        return try {
+            resolvePlaybackViaInnerTube(
+                videoId = videoId,
+                playlistId = playlistId,
+                audioQuality = audioQuality,
+                connectivityManager = connectivityManager,
+                preferredStreamClient = preferredStreamClient,
+                networkMetered = networkMetered,
+                avoidCodecs = avoidCodecs,
+                forceDirectUrl = forceDirectUrl,
+            )
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Timber.tag(logTag).w(error, "InnerTube playback resolution failed for $videoId; trying NewPipe fallback")
+            val viaNewPipe = resolvePlaybackViaNewPipe(videoId, audioQuality)
+            if (viaNewPipe != null) return viaNewPipe
+            val base = error.message ?: "Playback resolution failed"
+            val reason = lastNewPipeFailure?.takeIf { it.isNotBlank() }
+            throw PlaybackException(
+                if (reason == null) base else "$base [NewPipe: $reason]",
+                error,
+                if (error is PlaybackException) error.errorCode else PlaybackException.ERROR_CODE_REMOTE_ERROR,
+            )
+        }
+    }
+
+    private suspend fun resolvePlaybackViaInnerTube(
+        videoId: String,
+        playlistId: String?,
+        audioQuality: AudioQuality,
+        connectivityManager: ConnectivityManager,
+        preferredStreamClient: PlayerStreamClient,
+        networkMetered: Boolean?,
+        avoidCodecs: Set<String>,
+        forceDirectUrl: Boolean,
     ): PlaybackData {
         Timber.tag(logTag).i("Fetching player response for videoId: $videoId, playlistId: $playlistId")
         val signatureTimestamp = getSignatureTimestampOrNull(videoId)
@@ -312,7 +421,7 @@ object YTPlayerUtils {
                     if (cached != null && cached.expiresAtMs > System.currentTimeMillis()) {
                         cached.url
                     } else {
-                        findUrlOrNull(candidate, videoId, client)
+                        findUrlOrNull(candidate, videoId, client, forceDirectUrl)
                     } ?: continue
                 selectedFormat = candidate
                 selectedUrl = candidateUrl
@@ -325,9 +434,12 @@ object YTPlayerUtils {
             streamUrl = selectedUrl
             streamExpiresInSeconds = streamPlayerResponse.streamingData?.expiresInSeconds
 
-            if (streamExpiresInSeconds == null) {
-                streamPlayerResponse = null
-                continue
+            if (streamExpiresInSeconds == null || streamExpiresInSeconds <= 0) {
+                // YouTube may omit the expiry; derive it from the signed URL or default.
+                streamExpiresInSeconds = selectedUrl.toHttpUrlOrNull()
+                    ?.queryParameter("expire")?.toLongOrNull()
+                    ?.let { (it - System.currentTimeMillis() / 1000L).toInt() }
+                    ?.takeIf { it > 0 } ?: 3600
             }
 
             Timber.tag(logTag).i("Format found: ${format.mimeType}, bitrate: ${format.bitrate}")
@@ -596,8 +708,15 @@ object YTPlayerUtils {
         format: PlayerResponse.StreamingData.Format,
         videoId: String,
         client: YouTubeClient? = null,
+        forceDirectUrl: Boolean = false,
     ): String? {
         Timber.tag(logTag).i("Finding stream URL for format: ${format.mimeType}, videoId: $videoId")
+        if (!forceDirectUrl) {
+            NewPipeUtils.getFreshStreamUrl(videoId, format.itag).getOrNull()?.let { freshUrl ->
+                Timber.tag(logTag).i("Using fresh NewPipe stream URL for itag ${format.itag}")
+                return freshUrl
+            }
+        }
         var url = NewPipeUtils.getStreamUrl(format, videoId, client)
             .onSuccess { Timber.tag(logTag).i("Stream URL obtained successfully") }
             .onFailure {

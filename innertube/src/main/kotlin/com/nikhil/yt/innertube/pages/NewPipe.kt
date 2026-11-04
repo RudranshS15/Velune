@@ -22,12 +22,18 @@ import org.schabi.newpipe.extractor.downloader.Response
 import org.schabi.newpipe.extractor.exceptions.ParsingException
 import org.schabi.newpipe.extractor.exceptions.ReCaptchaException
 import org.schabi.newpipe.extractor.services.youtube.YoutubeJavaScriptPlayerManager
+import org.schabi.newpipe.extractor.ServiceList
+import org.schabi.newpipe.extractor.stream.StreamInfo
+import org.schabi.newpipe.extractor.stream.AudioStream
 import java.io.IOException
 import java.net.Proxy
 import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
 
 private class NewPipeDownloaderImpl(proxy: Proxy?) : Downloader() {
+
+    @Volatile
+    var cookieEnabled: Boolean = true
 
     private val client = OkHttpClient.Builder()
         .proxy(proxy)
@@ -68,7 +74,24 @@ private class NewPipeDownloaderImpl(proxy: Proxy?) : Downloader() {
             requestBuilder.header("User-Agent", YouTubeClient.USER_AGENT_WEB)
         }
 
-        val response = client.newCall(requestBuilder.build()).execute()
+        val cookie = YouTube.cookie
+        val injectedCookie = cookieEnabled && !cookie.isNullOrBlank() &&
+            headers.keys.none { it.equals("Cookie", ignoreCase = true) }
+        if (injectedCookie) {
+            requestBuilder.header("Cookie", cookie!!)
+        }
+
+        val builtRequest = requestBuilder.build()
+        var response = client.newCall(builtRequest).execute()
+
+        // A stale or partial session cookie makes the extractor fail with 401/403.
+        // Retry the same request anonymously before reporting a failure.
+        if (injectedCookie && response.code in 401..403) {
+            response.close()
+            response = client.newCall(
+                builtRequest.newBuilder().removeHeader("Cookie").build()
+            ).execute()
+        }
 
         if (response.code == 429) {
             response.close()
@@ -86,12 +109,70 @@ private class NewPipeDownloaderImpl(proxy: Proxy?) : Downloader() {
 
 object NewPipeUtils {
 
+    private val downloader = NewPipeDownloaderImpl(YouTube.proxy)
+
     init {
-        NewPipe.init(NewPipeDownloaderImpl(YouTube.proxy))
+        NewPipe.init(downloader)
     }
 
     fun getSignatureTimestamp(videoId: String): Result<Int> = runCatching {
         YoutubeJavaScriptPlayerManager.getSignatureTimestamp(videoId)
+    }
+
+    fun getFreshStreamUrl(videoId: String, itag: Int): Result<String> = runCatching {
+    val info = StreamInfo.getInfo(
+        ServiceList.YouTube,
+        "https://www.youtube.com/watch?v=$videoId",
+    )
+    info.audioStreams
+        .firstOrNull { it.itag == itag }
+        ?.content
+        ?: throw ParsingException("No fresh stream URL for itag $itag")
+}
+
+    fun getFallbackAudioStream(videoId: String): Result<FallbackAudioStream> {
+        val authenticated = runCatching { extractFallbackAudioStream(videoId) }
+        if (authenticated.isSuccess) return authenticated
+
+        downloader.cookieEnabled = false
+        val anonymous = try {
+            runCatching { extractFallbackAudioStream(videoId) }
+        } finally {
+            downloader.cookieEnabled = true
+        }
+        authenticated.exceptionOrNull()?.let { first ->
+            anonymous.exceptionOrNull()?.addSuppressed(first)
+        }
+        return anonymous
+    }
+
+    private fun extractFallbackAudioStream(videoId: String): FallbackAudioStream {
+        val info = StreamInfo.getInfo(
+            ServiceList.YouTube,
+            "https://www.youtube.com/watch?v=$videoId",
+        )
+        val stream = info.audioStreams
+            .asSequence()
+            .filter { it.isUrl && it.content.isNotBlank() }
+            .sortedWith(
+                compareByDescending<AudioStream> {
+                    it.averageBitrate.takeIf { bitrate -> bitrate > 0 } ?: it.bitrate
+                }
+            )
+            .firstOrNull()
+            ?: throw ParsingException("No audio stream available")
+
+        return FallbackAudioStream(
+            url = stream.content,
+            itag = stream.itag,
+            bitrate = stream.bitrate.takeIf { it > 0 }
+                ?: stream.averageBitrate.takeIf { it > 0 }
+                ?: 128_000,
+            mimeType = stream.format?.mimeType ?: "audio/mp4",
+            codec = stream.codec,
+            quality = stream.quality,
+            durationSeconds = info.duration.takeIf { it > 0 },
+        )
     }
 
     fun getStreamUrl(format: PlayerResponse.StreamingData.Format, videoId: String, client: YouTubeClient? = null): Result<String> =
@@ -162,3 +243,13 @@ object NewPipeUtils {
     }
 
 }
+
+data class FallbackAudioStream(
+    val url: String,
+    val itag: Int,
+    val bitrate: Int,
+    val mimeType: String,
+    val codec: String?,
+    val quality: String?,
+    val durationSeconds: Long?,
+)

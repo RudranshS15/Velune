@@ -101,13 +101,13 @@ android {
             signingConfig = signingConfigs.getByName("release")
         }
         debug {
-            applicationIdSuffix = ".debug"
+            applicationIdSuffix = ".v5"
             isDebuggable = true
         }
     }
 
     compileOptions {
-        isCoreLibraryDesugaringEnabled = false
+        isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
     }
@@ -130,7 +130,7 @@ android {
     }
 
     androidResources {
-        generateLocaleConfig = true
+        generateLocaleConfig = false
     }
 
     packaging {

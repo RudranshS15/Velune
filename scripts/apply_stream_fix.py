@@ -96,11 +96,44 @@ blocked = '''private val RESTORE_BLOCKED_KEYS = setOf(
     "proxyType",
     "streamBypassProxy",
 )
+
+// Account session state lives in the same DataStore as ordinary settings.
+// Restoring a backup used to overwrite a live login with the (usually stale)
+// cookie/visitorData pair captured when the backup was made, which makes
+// InnerTube answer "Video unavailable" for every track. Keep this state out of
+// backups entirely and never let a restore touch the session that is signed in.
+private val SESSION_BLOCKED_KEYS = setOf(
+    "innerTubeCookie",
+    "dataSyncId",
+    "visitorData",
+    "poToken",
+    "poTokenGvs",
+    "poTokenPlayer",
+    "poTokenSourceUrl",
+    "webClientPoTokenEnabled",
+    "accountName",
+    "accountEmail",
+    "accountChannelHandle",
+    "useVisitorData",
+    "useLoginForBrowse",
+)
 '''
 
 anchor = "data class BackupRestoreProgressUi("
 assert text.count(anchor) == 1, f"backup model anchor matches: {text.count(anchor)}"
 text = text.replace(anchor, blocked + "\n" + anchor)
+
+# Never write the session into a backup file.
+pattern = re.compile(r"for \(\(key, value\) in prefs\) \{\n([ \t]*)val tagName = when \(value\) \{")
+assert len(pattern.findall(text)) == 1, f"backup loop matches: {len(pattern.findall(text))}"
+text = pattern.sub(
+    lambda m: "for ((key, value) in prefs) {\n"
+    + m.group(1)
+    + "if (key.name in SESSION_BLOCKED_KEYS) continue\n"
+    + m.group(1)
+    + "val tagName = when (value) {",
+    text,
+)
 
 # Legacy backups can contain the binary DataStore snapshot. Restoring it would
 # overwrite every setting, bypassing the key filter below.
@@ -110,7 +143,10 @@ text = pattern.sub("", text)
 
 pattern = re.compile(r"if \(keyName != null\) \{")
 assert len(pattern.findall(text)) == 1, f"settings key filter matches: {len(pattern.findall(text))}"
-text = pattern.sub("if (keyName != null && keyName !in RESTORE_BLOCKED_KEYS) {", text)
+text = pattern.sub(
+    "if (keyName != null && keyName !in RESTORE_BLOCKED_KEYS && keyName !in SESSION_BLOCKED_KEYS) {",
+    text,
+)
 
 # Remove values already present from an earlier restore, then apply the sanitized XML.
 pattern = re.compile(

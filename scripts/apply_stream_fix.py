@@ -501,3 +501,172 @@ label.write_text(
     encoding="utf-8",
 )
 print("Separate app identity applied: com.nikhil.yt.v5 / Velune v5")
+
+# 11) The NewPipe audio path is the only way to get sound when InnerTube reports
+# the video as unavailable. A stale session cookie makes the extractor fail with
+# 401/403, so retry anonymously, and surface the real reason on failure.
+newpipe = Path("innertube/src/main/kotlin/com/nikhil/yt/innertube/pages/NewPipe.kt")
+text = newpipe.read_text(encoding="utf-8")
+
+old = '''private class NewPipeDownloaderImpl(proxy: Proxy?) : Downloader() {
+
+    private val client = OkHttpClient.Builder()'''
+assert text.count(old) == 1, f"downloader head matches: {text.count(old)}"
+text = text.replace(
+    old,
+    '''private class NewPipeDownloaderImpl(proxy: Proxy?) : Downloader() {
+
+    @Volatile
+    var cookieEnabled: Boolean = true
+
+    private val client = OkHttpClient.Builder()''',
+)
+
+old = '''        val cookie = YouTube.cookie
+        if (!cookie.isNullOrBlank() && headers.keys.none { it.equals("Cookie", ignoreCase = true) }) {
+            requestBuilder.header("Cookie", cookie)
+        }
+
+        val response = client.newCall(requestBuilder.build()).execute()'''
+assert text.count(old) == 1, f"cookie block matches: {text.count(old)}"
+text = text.replace(
+    old,
+    '''        val cookie = YouTube.cookie
+        val injectedCookie = cookieEnabled && !cookie.isNullOrBlank() &&
+            headers.keys.none { it.equals("Cookie", ignoreCase = true) }
+        if (injectedCookie) {
+            requestBuilder.header("Cookie", cookie!!)
+        }
+
+        val builtRequest = requestBuilder.build()
+        var response = client.newCall(builtRequest).execute()
+
+        // A stale or partial session cookie makes the extractor fail with 401/403.
+        // Retry the same request anonymously before reporting a failure.
+        if (injectedCookie && response.code in 401..403) {
+            response.close()
+            response = client.newCall(
+                builtRequest.newBuilder().removeHeader("Cookie").build()
+            ).execute()
+        }''',
+)
+
+old = '''    init {
+        NewPipe.init(NewPipeDownloaderImpl(YouTube.proxy))
+    }'''
+assert text.count(old) == 1, f"newpipe init matches: {text.count(old)}"
+text = text.replace(
+    old,
+    '''    private val downloader = NewPipeDownloaderImpl(YouTube.proxy)
+
+    init {
+        NewPipe.init(downloader)
+    }''',
+)
+
+pattern = re.compile(
+    r"    fun getFallbackAudioStream\(videoId: String\): Result<FallbackAudioStream> = runCatching \{.*?\n    \}\n",
+    re.S,
+)
+assert len(pattern.findall(text)) == 1, f"fallback function matches: {len(pattern.findall(text))}"
+fallback_fn = '''    fun getFallbackAudioStream(videoId: String): Result<FallbackAudioStream> {
+        val authenticated = runCatching { extractFallbackAudioStream(videoId) }
+        if (authenticated.isSuccess) return authenticated
+
+        downloader.cookieEnabled = false
+        val anonymous = try {
+            runCatching { extractFallbackAudioStream(videoId) }
+        } finally {
+            downloader.cookieEnabled = true
+        }
+        authenticated.exceptionOrNull()?.let { first ->
+            anonymous.exceptionOrNull()?.addSuppressed(first)
+        }
+        return anonymous
+    }
+
+    private fun extractFallbackAudioStream(videoId: String): FallbackAudioStream {
+        val info = StreamInfo.getInfo(
+            ServiceList.YouTube,
+            "https://www.youtube.com/watch?v=$videoId",
+        )
+        val stream = info.audioStreams
+            .asSequence()
+            .filter { it.isUrl && it.content.isNotBlank() }
+            .sortedWith(
+                compareByDescending<AudioStream> {
+                    it.averageBitrate.takeIf { bitrate -> bitrate > 0 } ?: it.bitrate
+                }
+            )
+            .firstOrNull()
+            ?: throw ParsingException("No audio stream available")
+
+        return FallbackAudioStream(
+            url = stream.content,
+            itag = stream.itag,
+            bitrate = stream.bitrate.takeIf { it > 0 }
+                ?: stream.averageBitrate.takeIf { it > 0 }
+                ?: 128_000,
+            mimeType = stream.format?.mimeType ?: "audio/mp4",
+            codec = stream.codec,
+            quality = stream.quality,
+            durationSeconds = info.duration.takeIf { it > 0 },
+        )
+    }
+'''
+text = pattern.sub(fallback_fn, text, count=1)
+newpipe.write_text(text, encoding="utf-8")
+print("NewPipe fallback retries anonymously on cookie failure")
+
+player_utils = Path("app/src/main/kotlin/com/nikhil/yt/utils/YTPlayerUtils.kt")
+text = player_utils.read_text(encoding="utf-8")
+
+old = '''    private fun resolvePlaybackViaNewPipe(
+        videoId: String,
+        audioQuality: AudioQuality,
+    ): PlaybackData? {
+        val fallback = NewPipeUtils.getFallbackAudioStream(videoId)
+            .onFailure { Timber.tag(logTag).e(it, "NewPipe fallback failed for $videoId") }
+            .getOrNull()
+            ?: return null
+'''
+assert text.count(old) == 1, f"newpipe resolver head matches: {text.count(old)}"
+text = text.replace(
+    old,
+    '''    private var lastNewPipeFailure: String? = null
+
+    private fun resolvePlaybackViaNewPipe(
+        videoId: String,
+        audioQuality: AudioQuality,
+    ): PlaybackData? {
+        val result = NewPipeUtils.getFallbackAudioStream(videoId)
+        result.onFailure {
+            lastNewPipeFailure = "${it.javaClass.simpleName}: ${it.message ?: "no detail"}"
+            Timber.tag(logTag).e(it, "NewPipe fallback failed for $videoId")
+        }
+        val fallback = result.getOrNull() ?: return null
+''',
+)
+
+old = '''        } catch (error: Exception) {
+            Timber.tag(logTag).w(error, "InnerTube playback resolution failed for $videoId; trying NewPipe fallback")
+            resolvePlaybackViaNewPipe(videoId, audioQuality) ?: throw error
+        }'''
+assert text.count(old) == 1, f"newpipe catch matches: {text.count(old)}"
+text = text.replace(
+    old,
+    '''        } catch (error: Exception) {
+            Timber.tag(logTag).w(error, "InnerTube playback resolution failed for $videoId; trying NewPipe fallback")
+            val viaNewPipe = resolvePlaybackViaNewPipe(videoId, audioQuality)
+            if (viaNewPipe != null) return viaNewPipe
+            val base = error.message ?: "Playback resolution failed"
+            val reason = lastNewPipeFailure?.takeIf { it.isNotBlank() }
+            throw PlaybackException(
+                if (reason == null) base else "$base [NewPipe: $reason]",
+                error,
+                if (error is PlaybackException) error.errorCode else PlaybackException.ERROR_CODE_REMOTE_ERROR,
+            )
+        }''',
+)
+player_utils.write_text(text, encoding="utf-8")
+print("Playback errors now report the NewPipe failure reason")

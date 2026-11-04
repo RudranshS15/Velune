@@ -481,3 +481,23 @@ replacement = '''    private suspend fun playerResponseForPlaybackOnce(
 text = text.replace(old, replacement)
 player_utils.write_text(text, encoding="utf-8")
 print("NewPipe playback fallback added")
+
+# 10) Ship as its own app so it installs beside the stock app and the earlier
+# patched build instead of trying to update one of them (different package).
+app_gradle = Path("app/build.gradle.kts")
+text = app_gradle.read_text(encoding="utf-8")
+old = 'applicationIdSuffix = ".debug"'
+assert text.count(old) == 1, f"applicationIdSuffix matches: {text.count(old)}"
+text = text.replace(old, 'applicationIdSuffix = ".v5"')
+app_gradle.write_text(text, encoding="utf-8")
+
+label = Path("app/src/debug/res/values/app_name.xml")
+label.parent.mkdir(parents=True, exist_ok=True)
+label.write_text(
+    '<?xml version="1.0" encoding="utf-8"?>\n'
+    '<resources>\n'
+    '    <string name="app_name">Velune v5</string>\n'
+    '</resources>\n',
+    encoding="utf-8",
+)
+print("Separate app identity applied: com.nikhil.yt.v5 / Velune v5")

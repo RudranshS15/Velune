@@ -670,3 +670,15 @@ text = text.replace(
 )
 player_utils.write_text(text, encoding="utf-8")
 print("Playback errors now report the NewPipe failure reason")
+
+# 12) NewPipe's extractor calls java.net.URLDecoder.decode(String, Charset), a
+# Java 10 API that does not exist before Android 13. Core library desugaring
+# backports it, and the dependency was already declared, but the flag was off,
+# so every NewPipe fallback died with NoSuchMethodError on older devices.
+app_gradle = Path("app/build.gradle.kts")
+text = app_gradle.read_text(encoding="utf-8")
+old = "isCoreLibraryDesugaringEnabled = false"
+assert text.count(old) == 1, f"desugaring flag matches: {text.count(old)}"
+text = text.replace(old, "isCoreLibraryDesugaringEnabled = true")
+app_gradle.write_text(text, encoding="utf-8")
+print("Core library desugaring enabled for the NewPipe extractor")
